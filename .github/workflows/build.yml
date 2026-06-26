@@ -1,1 +1,35 @@
-
+name: Build JoyConFix.dylib
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Build dylib
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          clang \
+            -arch arm64 \
+            -arch arm64e \
+            -dynamiclib \
+            -fobjc-arc \
+            -isysroot "$SDK" \
+            -mios-version-min=14.0 \
+            -framework GameController \
+            -framework Foundation \
+            -install_name /usr/lib/JoyConFix.dylib \
+            -o JoyConFix.dylib \
+            JoyConFix.m
+      - name: Ad-hoc signieren
+        run: |
+          brew install ldid
+          ldid -S JoyConFix.dylib
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: JoyConFix
+          path: JoyConFix.dylib
