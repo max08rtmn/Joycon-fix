@@ -1,245 +1,149 @@
-/*
- * JoyConFix.dylib
- * Single JoyCon horizontal mode fix for LiveContainer (iOS)
- *
- * Drop into LiveContainer's tweak folder.
- * Hooks GameController.framework to remap single JoyCon inputs correctly.
- *
- * Build with Theos:
- *   make ARCHS="arm64 arm64e" TARGET="iphone:clang:16.5:14.0"
- *
- * Or manually:
- *   clang -arch arm64 -arch arm64e \
- *     -dynamiclib -fobjc-arc \
- *     -framework GameController -framework Foundation \
- *     -rpath /usr/lib \
- *     -install_name /usr/lib/JoyConFix.dylib \
- *     -o JoyConFix.dylib joycon_fix_standalone.m
- */
+    if (callbackReportID == 0x3f) {
+        *buttons1Index = 0;
+        *buttons2Index = 1;
+        *hatIndex = 2;
+        return YES;
+    }
 
-#import <Foundation/Foundation.h>
-#import <GameController/GameController.h>
-#import <objc/runtime.h>
-
-// ================================================================
-//  Helpers
-// ================================================================
-
-static BOOL isJoyConController(GCController *c) {
-    NSString *name = c.vendorName ?: @"";
-    return ([name containsString:@"Joy-Con"] ||
-            [name containsString:@"JoyCon"]  ||
-            [name containsString:@"Nintendo"]);
+    return NO;
 }
 
-static BOOL isSingleMode(GCExtendedGamepad *pad) {
-    // In pair mode both sticks have activity; in single mode right stick is always zeroed
-    return (fabsf(pad.rightThumbstick.xAxis.value) < 0.01f &&
-            fabsf(pad.rightThumbstick.yAxis.value) < 0.01f);
+static uint8_t JCFNormalizeFaceCluster(uint8_t buttons1) {
+    uint8_t rawFace = buttons1 & 0x0f;
+    uint8_t normalizedFace = 0;
+
+    /*
+     Captured physical order:
+       top    -> 0x08
+       right  -> 0x02
+       bottom -> 0x01
+       left   -> 0x04
+
+     Normal simple-controller order used by many parsers:
+       Y/left -> 0x01
+       X/top  -> 0x02
+       B/down -> 0x04
+       A/right-> 0x08
+    */
+    if (rawFace & 0x08) normalizedFace |= 0x02;
+    if (rawFace & 0x02) normalizedFace |= 0x08;
+    if (rawFace & 0x01) normalizedFace |= 0x04;
+    if (rawFace & 0x04) normalizedFace |= 0x01;
+
+    return (buttons1 & 0xf0) | normalizedFace;
 }
 
-// Rotate a 2-D vector 90° clockwise (corrects horizontal-hold orientation)
-static void rotate90CW(float x, float y, float *outX, float *outY) {
-    *outX =  y;
-    *outY = -x;
-}
+static void JCFNormalizeJoyConReport(uint8_t *report, CFIndex reportLength, uint32_t callbackReportID) {
+    CFIndex buttons1Index = 0;
+    CFIndex buttons2Index = 0;
+    CFIndex hatIndex = 0;
 
-// ================================================================
-//  Swizzle helpers
-// ================================================================
-
-static void swizzleInstanceMethod(Class cls,
-                                   SEL original,
-                                   SEL replacement) {
-    Method orig = class_getInstanceMethod(cls, original);
-    Method repl = class_getInstanceMethod(cls, replacement);
-    if (orig && repl) method_exchangeImplementations(orig, repl);
-}
-
-// ================================================================
-//  GCExtendedGamepad category — wraps valueChangedHandler
-// ================================================================
-
-@interface GCExtendedGamepad (JoyConFix)
-- (void)jcfix_setValueChangedHandler:(GCExtendedGamepadValueChangedHandler)handler;
-@end
-
-@implementation GCExtendedGamepad (JoyConFix)
-
-- (void)jcfix_setValueChangedHandler:(GCExtendedGamepadValueChangedHandler)handler {
-    if (!handler) {
-        [self jcfix_setValueChangedHandler:nil];
+    if (!JCFResolveReportIndexes(report, reportLength, callbackReportID, &buttons1Index, &buttons2Index, &hatIndex)) {
         return;
     }
 
-    __weak GCExtendedGamepad *weakPad = self;
+    uint8_t buttons1 = report[buttons1Index];
+    uint8_t buttons2 = report[buttons2Index];
+    uint8_t originalButtons1 = buttons1;
+    uint8_t originalButtons2 = buttons2;
 
-    GCExtendedGamepadValueChangedHandler wrapped =
-    ^(GCExtendedGamepad *pad, GCControllerElement *element) {
+    buttons1 = JCFNormalizeFaceCluster(buttons1);
 
-        GCController *ctrl = pad.controller;
-
-        if (isJoyConController(ctrl) && isSingleMode(pad)) {
-
-            // ── Stick: rotate 90° CW to correct horizontal-hold ──────────
-            if (element == pad.leftThumbstick         ||
-                element == pad.leftThumbstick.xAxis   ||
-                element == pad.leftThumbstick.yAxis) {
-
-                float rawX = pad.leftThumbstick.xAxis.value;
-                float rawY = pad.leftThumbstick.yAxis.value;
-                float fixX, fixY;
-                rotate90CW(rawX, rawY, &fixX, &fixY);
-
-                NSLog(@"[JoyConFix] Stick corrected (%.2f,%.2f)→(%.2f,%.2f)",
-                      rawX, rawY, fixX, fixY);
-
-                // GCControllerAxisInput values are read-only; we synthesize a
-                // new handler call with swapped axes by temporarily redirecting
-                // through the dpad when the host already listens there.
-                // Best-effort: pass corrected values to the original handler
-                // wrapped in a dummy element so the app can read them via
-                // pad.leftThumbstick.xAxis / .yAxis after our KVO patch below.
-            }
-
-            // ── D-Pad used as stick: also rotate ─────────────────────────
-            if (element == pad.dpad         ||
-                element == pad.dpad.xAxis   ||
-                element == pad.dpad.yAxis) {
-
-                float rawX = pad.dpad.xAxis.value;
-                float rawY = pad.dpad.yAxis.value;
-                float fixX, fixY;
-                rotate90CW(rawX, rawY, &fixX, &fixY);
-
-                NSLog(@"[JoyConFix] DPad→Stick corrected (%.2f,%.2f)→(%.2f,%.2f)",
-                      rawX, rawY, fixX, fixY);
-            }
-
-            // ── Shoulder buttons: SL/SR → L/R ────────────────────────────
-            // In single mode SL and SR are the shoulder buttons;
-            // they appear as leftShoulder / rightShoulder in the HID report
-            // but some hosts misread them. Log for debug.
-            if (element == pad.leftShoulder) {
-                NSLog(@"[JoyConFix] SL (left shoulder) pressed: %.2f",
-                      pad.leftShoulder.value);
-            }
-            if (element == pad.rightShoulder) {
-                NSLog(@"[JoyConFix] SR (right shoulder) pressed: %.2f",
-                      pad.rightShoulder.value);
-            }
-
-            // ── ABXY: single JoyCon rotates face buttons 90° ─────────────
-            // Physical (horizontal left JoyCon):
-            //   ↓ = A   ←  = B   ↑ = X   → = Y
-            // We log raw state; LiveContainer sees the remapped values
-            // because we block the microGamepad profile below.
-            NSLog(@"[JoyConFix] Face A:%d B:%d X:%d Y:%d",
-                  pad.buttonA.isPressed, pad.buttonB.isPressed,
-                  pad.buttonX.isPressed, pad.buttonY.isPressed);
-        }
-
-        // Always call the original handler so the app still receives input
-        handler(pad, element);
-    };
-
-    // Call our swizzled original (which is the real setter)
-    [self jcfix_setValueChangedHandler:wrapped];
-}
-
-@end
-
-// ================================================================
-//  GCController category — block microGamepad misidentification
-// ================================================================
-
-@interface GCController (JoyConFix)
-- (GCMicroGamepad *)jcfix_microGamepad;
-@end
-
-@implementation GCController (JoyConFix)
-
-- (GCMicroGamepad *)jcfix_microGamepad {
-    if (isJoyConController(self)) {
-        // Force the host to use extendedGamepad instead of microGamepad
-        // This prevents the stick being read as a D-Pad and all-buttons-at-once bug
-        NSLog(@"[JoyConFix] Suppressing microGamepad for %@", self.vendorName);
-        return nil;
+    /*
+     Make the small rail buttons usable as the main shoulder controls in
+     single-Joy-Con mode. The original bits stay set as well, so software that
+     already understands SL/SR can still see them.
+    */
+    if (originalButtons1 & 0x10) {
+        buttons2 |= 0x40;
     }
-    return [self jcfix_microGamepad]; // Original
+
+    if (originalButtons1 & 0x20) {
+        buttons2 |= 0x80;
+    }
+
+    report[buttons1Index] = buttons1;
+    report[buttons2Index] = buttons2;
+
+    JCFLog(@"normalized report 0x%02x: b1 %02x->%02x b2 %02x->%02x hat %02x",
+           callbackReportID,
+           originalButtons1,
+           buttons1,
+           originalButtons2,
+           buttons2,
+           report[hatIndex]);
 }
 
-@end
-
-// ================================================================
-//  GCMicroGamepad category — fix stick-as-dpad in micro profile
-// ================================================================
-
-@interface GCMicroGamepad (JoyConFix)
-- (void)jcfix_setValueChangedHandler:(GCMicroGamepadValueChangedHandler)handler;
-@end
-
-@implementation GCMicroGamepad (JoyConFix)
-
-- (void)jcfix_setValueChangedHandler:(GCMicroGamepadValueChangedHandler)handler {
-    if (!handler) {
-        [self jcfix_setValueChangedHandler:nil];
+static void JCFInputReportCallback(void *context,
+                                   int32_t result,
+                                   void *sender,
+                                   uint32_t type,
+                                   uint32_t reportID,
+                                   uint8_t *report,
+                                   CFIndex reportLength) {
+    JCFCallbackContext *wrapped = (JCFCallbackContext *)context;
+    if (!wrapped || !wrapped->callback) {
         return;
     }
 
-    GCMicroGamepadValueChangedHandler wrapped =
-    ^(GCMicroGamepad *pad, GCControllerElement *element) {
+    if (wrapped->shouldNormalize) {
+        JCFNormalizeJoyConReport(report, reportLength, reportID);
+    }
 
-        GCController *ctrl = pad.controller;
-        if (isJoyConController(ctrl)) {
-            if (element == pad.dpad ||
-                element == pad.dpad.xAxis ||
-                element == pad.dpad.yAxis) {
-
-                float rawX = pad.dpad.xAxis.value;
-                float rawY = pad.dpad.yAxis.value;
-                float fixX, fixY;
-                rotate90CW(rawX, rawY, &fixX, &fixY);
-                NSLog(@"[JoyConFix][micro] DPad corrected (%.2f,%.2f)→(%.2f,%.2f)",
-                      rawX, rawY, fixX, fixY);
-            }
-        }
-        handler(pad, element);
-    };
-
-    [self jcfix_setValueChangedHandler:wrapped];
+    wrapped->callback(wrapped->context, result, sender, type, reportID, report, reportLength);
 }
 
-@end
+static void JCFReplacementRegisterInputReportCallback(void *device,
+                                                      uint8_t *report,
+                                                      CFIndex reportLength,
+                                                      JCFHIDReportCallback callback,
+                                                      void *context) {
+    JCFRegisterInputReportCallbackFn original = JCFOriginalRegisterInputReportCallback();
+    if (!original) {
+        return;
+    }
 
-// ================================================================
-//  __attribute__((constructor)) — runs when dylib is loaded
-// ================================================================
+    JCFCallbackContext *wrapped = (JCFCallbackContext *)calloc(1, sizeof(JCFCallbackContext));
+    if (!wrapped) {
+        original(device, report, reportLength, callback, context);
+        return;
+    }
+
+    wrapped->callback = callback;
+    wrapped->context = context;
+    wrapped->shouldNormalize = JCFDeviceLooksLikeJoyCon(device);
+
+    /*
+     Some fake or relayed Joy-Cons expose weak identity strings. If identity
+     detection fails, still allow report 0x3F to be normalized at callback time
+     when this device's actual reports match the captured Joy-Con shape.
+    */
+    if (!wrapped->shouldNormalize) {
+        NSInteger vendorID = JCFIntegerHIDProperty(device, CFSTR("VendorID"), -1);
+        NSInteger productID = JCFIntegerHIDProperty(device, CFSTR("ProductID"), -1);
+        wrapped->shouldNormalize = (vendorID == -1 && productID == -1);
+    }
+
+    JCFLog(@"registered HID report callback, normalize=%@", wrapped->shouldNormalize ? @"YES" : @"NO");
+    original(device, report, reportLength, JCFInputReportCallback, wrapped);
+}
+
+void IOHIDDeviceRegisterInputReportCallback(void *device,
+                                            uint8_t *report,
+                                            CFIndex reportLength,
+                                            JCFHIDReportCallback callback,
+                                            void *context) {
+    JCFReplacementRegisterInputReportCallback(device, report, reportLength, callback, context);
+}
 
 __attribute__((constructor))
-static void JoyConFixInit(void) {
-    NSLog(@"[JoyConFix] v1.0 loaded — Single JoyCon fix active");
-
-    // Swizzle GCExtendedGamepad -setValueChangedHandler:
-    swizzleInstanceMethod(
-        NSClassFromString(@"GCExtendedGamepad"),
-        @selector(setValueChangedHandler:),
-        @selector(jcfix_setValueChangedHandler:)
-    );
-
-    // Swizzle GCController -microGamepad
-    swizzleInstanceMethod(
-        NSClassFromString(@"GCController"),
-        @selector(microGamepad),
-        @selector(jcfix_microGamepad)
-    );
-
-    // Swizzle GCMicroGamepad -setValueChangedHandler:
-    swizzleInstanceMethod(
-        NSClassFromString(@"GCMicroGamepad"),
-        @selector(setValueChangedHandler:),
-        @selector(jcfix_setValueChangedHandler:)
-    );
-
-    NSLog(@"[JoyConFix] Swizzles installed successfully");
+static void JCFInstall(void) {
+    @autoreleasepool {
+        /*
+         Loading this dylib is enough. It first patches existing imports, then
+         dyld calls the same rebinder for later-loaded images.
+        */
+        _dyld_register_func_for_add_image(JCFRebindImage);
+        JCFLog(@"loaded");
+    }
 }
